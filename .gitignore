@@ -1,0 +1,6 @@
+HANDOFF.md
+oauth2.json
+.env
+.last_alert
+.venv/
+__pycache__/
