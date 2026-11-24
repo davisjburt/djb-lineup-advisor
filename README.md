@@ -22,5 +22,6 @@ I make any lineup changes myself in the Yahoo app. The script never writes to Ya
 ## Files
 - `lineup_advisor.py`: the advisor (`--print` to preview, `--date YYYY-MM-DD` to check a given day).
 - `install.sh`: installs it on a Raspberry Pi with a venv and a systemd timer (09:00 and 16:30 America/Chicago).
+- `access_watch.py`: a temporary hourly check that makes one read-only Yahoo call and sends a single ntfy push when API access goes live (HTTP 200), then stays quiet.
 
 Credentials (`oauth2.json`) and the notification topic (`.env`) stay on the device and are never committed.
