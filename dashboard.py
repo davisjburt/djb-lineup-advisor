@@ -127,11 +127,35 @@ def _num(x):
         return None
 
 
+def headshots(players_obj):
+    """{player_id: headshot URL} from a Yahoo 'players' JSON object.
+
+    The URLs point at Yahoo's own image server; the page links to them and
+    nothing is downloaded or stored here."""
+    out = {}
+    for k, v in (players_obj or {}).items():
+        if k == "count":
+            continue
+        info = {}
+        for part in v["player"][0]:
+            if isinstance(part, dict):
+                info.update(part)
+        url = (info.get("headshot") or {}).get("url") or info.get("image_url")
+        if url and str(info.get("player_id", "")).isdigit():
+            out[int(info["player_id"])] = url
+    return out
+
+
+def roster_headshots(lg, lk):
+    j = lg.yhandler.get(f"team/{lk}.t.{TEAM_ID}/roster/players")
+    return headshots(j["fantasy_content"]["team"][1]["roster"]["0"]["players"])
+
+
 def available_players(lg, lk):
-    """Top 25 available players by Yahoo's actual rank: one API call."""
+    """Top 25 available players by Yahoo's actual rank, with headshots: one API call."""
     j = lg.yhandler.get(f"league/{lk}/players;status=A;sort=AR;count=25/percent_owned")
     _, players = lg._players_from_page(j)
-    return players
+    return players, headshots(j["fantasy_content"]["league"][1]["players"])
 
 
 def season_avgs(lg, ids):
@@ -218,17 +242,21 @@ def build():
     plan_pos = {m["player_id"]: m["selected_position"] for m in moves}
 
     codes = {team_code(p.get("editorial_team_abbr")) for p in roster} - {None}
-    fa = available_players(lg, lk)
+    fa, shots = available_players(lg, lk)
+    try:
+        shots.update(roster_headshots(lg, lk))
+    except Exception:  # headshots are a nicety; never fail the page over them
+        log.warning("couldn't load roster headshots", exc_info=True)
     codes |= {team_code(p.get("editorial_team_abbr")) for p in fa} - {None}
     wk_counts, _ = week_games(today, codes)
 
     avgs = season_avgs(lg, [int(p["player_id"]) for p in roster] + [int(p["player_id"]) for p in fa])
     cview = category_view(rows, me)
     return render(today, roster, games_today, plan_pos, move_list, rows, me, cview,
-                  fa, avgs, wk_counts, positions)
+                  fa, avgs, wk_counts, positions, shots)
 
 
-def render(today, roster, games, plan_pos, move_list, rows, me, cview, fa, avgs, wk, positions):
+def render(today, roster, games, plan_pos, move_list, rows, me, cview, fa, avgs, wk, positions, shots):
     now = dt.datetime.now(TZ).strftime("%a %b %-d, %-I:%M %p")
     weak = weak_cats(cview)
     slot_order = {s: i for i, s in enumerate(
@@ -257,6 +285,14 @@ def render(today, roster, games, plan_pos, move_list, rows, me, cview, fa, avgs,
             return ""
         kind = "out" if status in OUT_STATUSES else "q"
         return f'<span class="badge {kind}">{esc(status)}</span>'
+
+    def player_cell(p, extra=""):
+        """Headshot, name, badges, and the team/positions line."""
+        url = shots.get(int(p["player_id"]))
+        img = (f'<img class="hs" src="{esc(url)}" alt="" width="32" height="40" loading="lazy" '
+               f'referrerpolicy="no-referrer">' if url else '<span class="hs"></span>')
+        return (f'<div class="pl">{img}<div><span class="name">{esc(p["name"])}</span>{extra}'
+                f'<div class="sub">{esc(p.get("editorial_team_abbr", ""))} · {esc(positions_of(p))}')
 
     def positions_of(p):
         return ", ".join(x for x in p.get("eligible_positions", []) if x not in NON_STARTING)
@@ -299,8 +335,7 @@ def render(today, roster, games, plan_pos, move_list, rows, me, cview, fa, avgs,
         a = avgs.get(int(pid), {})
         lineup_rows.append(
             f'<tr class="{"chg" if new != cur else ""}"><td class="slot">{slot}</td>'
-            f'<td><span class="name">{esc(p["name"])}</span>{badge(status)}'
-            f'<div class="sub">{esc(p.get("editorial_team_abbr", ""))} · {esc(positions_of(p))}</div></td>'
+            f'<td>{player_cell(p, badge(status))}</div></div></div></td>'
             f'<td>{game_cell(code)}</td><td class="num">{wk.get(code, 0)}</td>'
             + "".join(f'<td class="num">{stat(a.get(c), c)}</td>' for c in CAT_NAMES) + "</tr>")
     stat_heads = "".join(f'<th class="num">{c}</th>' for c in CAT_NAMES)
@@ -353,9 +388,8 @@ def render(today, roster, games, plan_pos, move_list, rows, me, cview, fa, avgs,
         status = (p.get("status") or "").upper()
         tag = f'<span class="helps">Helps {esc(", ".join(helps))}</span>' if helps else ""
         fa_rows.append(
-            f'<tr><td><span class="name">{esc(p["name"])}</span>{badge(status)}{tag}'
-            f'<div class="sub">{esc(p.get("editorial_team_abbr", ""))} · {esc(positions_of(p))} · '
-            f'{p.get("percent_owned", 0)}% owned</div></td><td class="num">{wk.get(code, 0)}</td>'
+            f'<tr><td>{player_cell(p, badge(status) + tag)} · '
+            f'{p.get("percent_owned", 0)}% owned</div></div></div></td><td class="num">{wk.get(code, 0)}</td>'
             + "".join(f'<td class="num">{stat(a.get(c), c)}</td>' for c in CAT_NAMES) + "</tr>")
 
     rank = me["rank"]
@@ -409,11 +443,13 @@ h2{{font-size:15px;line-height:20px;font-weight:500;margin:0 0 16px}}
 
 .scroll{{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -20px;padding:0 20px}}
 table{{border-collapse:collapse;width:100%}}
-th,td{{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;white-space:nowrap}}
+th,td{{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;white-space:nowrap}}
 th{{font-size:12px;line-height:16px;color:var(--mut);font-weight:400}}
 tr:last-child td{{border-bottom:0}}
 td.num,th.num{{text-align:right}}td.num{{font-size:13px}}
 .name{{font-weight:500}}
+.pl{{display:flex;align-items:center;gap:12px}}
+.hs{{flex:none;width:32px;height:40px;border-radius:8px;background:var(--raised);object-fit:cover;object-position:top}}
 td.slot{{color:var(--sec);font-size:13px}}td.slot .to{{color:var(--acc);font-weight:500}}td.slot .was{{color:var(--mut)}}
 tr.chg td{{background:var(--accsoft)}}
 tr.me td{{background:var(--raised)}}tr.me td:nth-child(2){{font-weight:500;color:var(--acc)}}
