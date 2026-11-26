@@ -356,11 +356,15 @@ def category_plans(rows, me, roster, avgs, per_cat, wk_this):
                 their_rate = below["vals"][cat] / (below["gp"] or 1)
                 games = lead / their_rate if their_rate else None
                 plan["defend_games"] = games
-                plan["defend"] = (f'You lead {below["name"]} by {lead:,.0f}, {games_txt(games)} of their '
-                                  f'production. ' + ("They average more per game, so your lead comes from playing more games. "
-                                                     "Keep every active slot filled"
-                                                     if their_rate > my_rate else "You out-produce them per game, so it should hold "
-                                                     "if your slots stay filled"))
+                fmt = (lambda x: f"{x:.2f}") if max(their_rate, my_rate) < 2 else (lambda x: f"{x:.1f}")
+                if their_rate > my_rate:
+                    why = (f'They average {fmt(their_rate)} per player-game to your {fmt(my_rate)}, so your edge is volume: '
+                           f'{my_gp:.0f} games played to their {below["gp"]:.0f}. Keep every active slot filled')
+                else:
+                    why = (f'You average {fmt(my_rate)} per player-game to their {fmt(their_rate)}, '
+                           f'so it should hold as long as your slots stay filled')
+                plan["defend"] = (f'You lead {below["name"]} by {lead:,.0f} {cat}, {games_txt(games)} of their '
+                                  f'production. {why}')
 
         g, d = plan["gain_games"], plan["defend_games"]
         # Whichever swing is closer decides what this category is about right now.
@@ -389,38 +393,105 @@ def gap_fmt(v, cat):
     return f"{v:.3f}".lstrip("0") if cat in PCT else f"{v:,.0f}"
 
 
-def waiver_ideas(roster, fa, avgs, value, per_cat, plans, wk_this):
-    """Add/drop pairs worth considering. Every add needs a drop: the 3 bench spots
-    are full and IL slots don't count. Players on IL are never suggested as drops."""
-    targets = [p["cat"] for p in plans if p["status"] in ("gain", "defend")]
-    weak = [p["cat"] for p in sorted(plans, key=lambda p: p["pts"] or 0)[:3]]
-    focus = list(dict.fromkeys(targets + weak))
-    droppable = [p for p in roster if p.get("selected_position") not in IL_SLOTS
-                 and int(p["player_id"]) in value]
-    if not droppable:
-        return []
-    droppable.sort(key=lambda p: value[int(p["player_id"])])
-    ideas = []
-    for drop in droppable[:2]:
-        dv = value[int(drop["player_id"])]
-        best = None
-        for p in fa:
-            pid = int(p["player_id"])
-            if pid not in value or (p.get("status") or "").upper() in OUT_STATUSES:
+def roto_points(values, mine_key):
+    """Roto points for `mine_key` in one category: 1 per team you beat plus 1 for
+    yourself, with ties split, the way Yahoo scores it (12 is best)."""
+    mine = values[mine_key]
+    lower = sum(1 for k, v in values.items() if k != mine_key and v < mine)
+    ties = sum(1 for k, v in values.items() if k != mine_key and v == mine)
+    return 1 + lower + 0.5 * ties
+
+
+def project(rows, horizon_pg):
+    """Every team's category values after `horizon_pg` more player-games at its
+    current per-game pace. Percentages project makes and attempts separately."""
+    proj = {}
+    for r in rows:
+        gp = r["gp"] or 1
+        t = {}
+        for cat in CAT_NAMES:
+            if cat in PCT:
+                m, a = r["ma"][cat]
+                if m is None or not a:
+                    t[cat] = (0.0, 0.0)
+                else:
+                    t[cat] = (m + m / gp * horizon_pg, a + a / gp * horizon_pg)
+            else:
+                v = r["vals"][cat] or 0
+                t[cat] = v + v / gp * horizon_pg
+        proj[r["key"]] = t
+    return proj
+
+
+def swap_delta(rows, me, proj, add_avg, add_g, drop_avg, drop_g):
+    """Roto points you'd gain or lose per category from swapping one player for
+    another over the projection horizon (other teams keep their pace)."""
+    deltas = {}
+    for cat in CAT_NAMES:
+        def value_of(t):
+            if cat in PCT:
+                m, a = t
+                return m / a if a else 0
+            return t
+
+        base = {k: value_of(t[cat]) for k, t in proj.items()}
+        mt = proj[me["key"]][cat]
+        if cat in PCT:
+            key = PCT[cat][0]
+            am, aa = _ma(add_avg.get(key))
+            dm, da = _ma(drop_avg.get(key))
+            m = mt[0] + (am or 0) * add_g - (dm or 0) * drop_g
+            a = mt[1] + (aa or 0) * add_g - (da or 0) * drop_g
+            new = m / a if a else 0
+        else:
+            new = mt + (_num(add_avg.get(cat)) or 0) * add_g - (_num(drop_avg.get(cat)) or 0) * drop_g
+        after = dict(base, **{me["key"]: new})
+        deltas[cat] = roto_points(after, me["key"]) - roto_points(base, me["key"])
+    return deltas
+
+
+def waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, today, next_mon):
+    """Add/drop pairs ranked by the roto points they're projected to win or lose
+    through the end of next week, given your current ranks.
+
+    Every add needs a drop: the 3 bench spots are full and IL slots don't count,
+    so players on IL are never suggested as drops. Only your lower-value players
+    are drop candidates, and a pickup has to be close to them in long-run value."""
+    days = (next_mon - today).days + 7
+    horizon_pg = 10 * days  # about 10 player-games a day for every team
+    proj = project(rows, horizon_pg)
+
+    def games(p):
+        code = team_code(p.get("editorial_team_abbr"))
+        return wk_this.get(code, 0) + wk_next.get(code, 0)
+
+    droppable = sorted((p for p in roster if p.get("selected_position") not in IL_SLOTS
+                        and int(p["player_id"]) in value), key=lambda p: value[int(p["player_id"])])[:5]
+    pairs = []
+    for drop in droppable:
+        did = int(drop["player_id"])
+        for add in fa:
+            aid = int(add["player_id"])
+            if aid not in avgs or (add.get("status") or "").upper() in OUT_STATUSES:
                 continue
-            gain = value[pid] - dv
-            focus_gain = sum(per_cat[c].get(pid, 0) - per_cat[c].get(int(drop["player_id"]), 0) for c in focus)
-            score = gain + 0.5 * focus_gain
-            if gain > 0.5 and (best is None or score > best[0]):
-                best = (score, p, gain)
-        if best and all(best[1]["player_id"] != i["add"]["player_id"] for i in ideas):
-            add = best[1]
-            pid, did = int(add["player_id"]), int(drop["player_id"])
-            ups = [c for c in CAT_NAMES if per_cat[c].get(pid, 0) - per_cat[c].get(did, 0) > 0.4]
-            downs = [c for c in CAT_NAMES if per_cat[c].get(pid, 0) - per_cat[c].get(did, 0) < -0.4]
-            ideas.append({"add": add, "drop": drop, "gain": best[2], "ups": ups, "downs": downs,
-                          "add_games": wk_this.get(team_code(add.get("editorial_team_abbr")), 0),
-                          "drop_games": wk_this.get(team_code(drop.get("editorial_team_abbr")), 0)})
+            if value.get(aid, -99) < value[did] - 0.5:
+                continue  # don't trade long-run value for a short-term bump
+            deltas = swap_delta(rows, me, proj, avgs[aid], games(add), avgs[did], games(drop))
+            net = sum(deltas.values())
+            pairs.append((net, value.get(aid, 0) - value[did], add, drop, deltas))
+    pairs.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    ideas, used = [], set()
+    for net, vdiff, add, drop, deltas in pairs:
+        if net <= 0 or len(ideas) == 3:
+            break
+        if add["player_id"] in used or drop["player_id"] in used:
+            continue
+        used |= {add["player_id"], drop["player_id"]}
+        ideas.append({"add": add, "drop": drop, "net": net, "vdiff": vdiff,
+                      "ups": {c: v for c, v in deltas.items() if v > 0},
+                      "downs": {c: v for c, v in deltas.items() if v < 0},
+                      "add_games": games(add), "drop_games": games(drop), "days": days})
     return ideas
 
 
@@ -461,7 +532,7 @@ def build():
         "moves": classify_moves(roster, moves), "fa": fa, "shots": shots,
         "wk_this": wk_this, "wk_next": wk_next, "per_day": per_day, "next_mon": next_mon,
         "avgs": avgs, "value": value, "per_cat": per_cat, "plans": plans,
-        "ideas": waiver_ideas(roster, fa, avgs, value, per_cat, plans, wk_this),
+        "ideas": waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, today, next_mon),
         "activity": activity,
     }
 
@@ -529,6 +600,8 @@ def ladder_html(plans, nteams):
 
         dots = "".join(f'<i style="left:{pos(v):.2f}%"></i>' for v in c["all"])
         me_dot = "" if c["val"] is None else f'<b style="left:{pos(c["val"]):.2f}%"></b>'
+        label = (f'{c["cat"]}: your total {total(c["val"], c["cat"])}, worth {c["pts"]:g} of {nteams} points. '
+                 f'League range {total(lo, c["cat"])} to {total(hi, c["cat"])}') if c["pts"] is not None else c["cat"]
         pts = "–" if c["pts"] is None else f'{c["pts"]:g}'
         up = ("Leading the league" if c["above"] is None else
               f'+{gap_fmt(c["above"]["vals"][c["cat"]] - c["val"], c["cat"])} to pass {esc(c["above"]["name"])}')
@@ -536,10 +609,10 @@ def ladder_html(plans, nteams):
                 f'{gap_fmt(c["val"] - c["below"]["vals"][c["cat"]], c["cat"])} ahead of {esc(c["below"]["name"])}')
         out.append(
             f'<div class="rung"><div class="cat">{esc(c["cat"])}</div>'
-            f'<div class="val">{total(c["val"], c["cat"])}</div>'
-            f'<div class="track"><span class="lo">{total(lo, c["cat"])}</span>{dots}{me_dot}'
-            f'<span class="hi">{total(hi, c["cat"])}</span></div>'
-            f'<div class="pts">{pts}<span class="of">/{nteams}</span></div>'
+            f'<div class="val" title="Your total"><span class="sr">Your total </span>{total(c["val"], c["cat"])}</div>'
+            f'<div class="track" role="img" aria-label="{esc(label)}"><span class="lo" aria-hidden="true">{total(lo, c["cat"])}</span>'
+            f'{dots}{me_dot}<span class="hi" aria-hidden="true">{total(hi, c["cat"])}</span></div>'
+            f'<div class="pts"><span class="sr">Roto points </span>{pts}<span class="of">/{nteams}</span></div>'
             f'<div class="note">{up}<span class="muted">{down}</span></div></div>')
     return '<div class="ladder">' + "".join(out) + "</div>"
 
@@ -550,6 +623,23 @@ STATUS_LABEL = {"defend": "Protect", "gain": "Within reach", "safe": "Safe",
 
 def names(players):
     return ", ".join(p["name"] for p in players)
+
+
+def pts_txt(v):
+    return f"{v:+g}".replace("-", "−")
+
+
+def delta_txt(i):
+    parts = [f'{pts_txt(v)} {c}' for c, v in sorted(i["ups"].items(), key=lambda kv: -kv[1])]
+    parts += [f'{pts_txt(v)} {c}' for c, v in sorted(i["downs"].items(), key=lambda kv: kv[1])]
+    return ", ".join(parts)
+
+
+def games_compare(i):
+    a, dr, ag, dg = i["add"]["name"], i["drop"]["name"], i["add_games"], i["drop_games"]
+    if ag == dg:
+        return f'Both have {ag} games through next week'
+    return f'{a} has {ag} games through next week, {dr} has {dg}'
 
 
 # ------------------------------------------------------------------ pages
@@ -589,14 +679,24 @@ def page_actions(d):
 
     for i in d["ideas"][:1]:
         a, dr = i["add"], i["drop"]
-        why = f'Better overall value (+{i["gain"]:.1f})'
-        if i["ups"]:
-            why += f', stronger in {", ".join(i["ups"])}'
-        if i["downs"]:
-            why += f', weaker in {", ".join(i["downs"])}'
-        why += f'. {a["name"]} has {i["add_games"]} games left this week, {dr["name"]} has {i["drop_games"]}'
+        why = (f'Projected {pts_txt(i["net"])} roto point{"" if abs(i["net"]) == 1 else "s"} by the end of next week '
+               f'({delta_txt(i)}). {games_compare(i)}')
         items.append((4, "Waiver idea", f'Consider adding <b>{esc(a["name"])}</b> for <b>{esc(dr["name"])}</b>',
                       esc(why) + '. <a href="/players">See all options</a>'))
+
+    # The team sitting just above you in the most close categories.
+    chase = {}
+    for c in plans:
+        if c["above"] is not None and c["gain_games"] is not None and c["gain_games"] <= 1.5 * CLOSE_GAMES:
+            chase.setdefault(c["above"]["key"], []).append(c)
+    if chase:
+        key, cats = max(chase.items(), key=lambda kv: len(kv[1]))
+        if len(cats) >= 2:
+            team = cats[0]["above"]["name"]
+            gaps = ", ".join(f'{c["cat"]} (+{gap_fmt(c["above"]["vals"][c["cat"]] - c["val"], c["cat"])})' for c in cats)
+            items.append((2.5, "Rival to chase", f'<b>{esc(team)}</b> is just above you in {len(cats)} categories',
+                          f'{esc(gaps)}. Passing them in all {"three" if len(cats) == 3 else len(cats)} '
+                          f'would be worth +{len(cats)} roto points.'))
 
     rivals = {r["key"] for r in d["rows"] if r is not me and abs(r["rank"] - me["rank"]) <= 3}
     since = d["built"] - dt.timedelta(days=2)
@@ -709,16 +809,15 @@ def page_players(d):
     ideas = []
     for i in d["ideas"]:
         a, dr = i["add"], i["drop"]
-        a_meta = f'{esc(a.get("editorial_team_abbr", ""))} · {i["add_games"]} games left this week'
-        d_meta = f'{esc(dr.get("editorial_team_abbr", ""))} · {i["drop_games"]} games left this week'
+        a_meta = f'{esc(a.get("editorial_team_abbr", ""))} · {i["add_games"]} games through next week'
+        d_meta = f'{esc(dr.get("editorial_team_abbr", ""))} · {i["drop_games"]} games through next week'
         ideas.append(
             f'<div class="idea"><div class="side"><span class="lbl">Add</span>{player_cell(d, a, meta=a_meta)}</div>'
             f'<div class="arrow">for</div>'
             f'<div class="side"><span class="lbl">Drop</span>{player_cell(d, dr, meta=d_meta)}</div>'
-            f'<div class="gains">Value +{i["gain"]:.1f}'
-            + (f' · better in {esc(", ".join(i["ups"]))}' if i["ups"] else "")
-            + (f' · worse in {esc(", ".join(i["downs"]))}' if i["downs"] else "") + "</div></div>")
-    ideas_html = "".join(ideas) or '<p class="ok">No available player beats your weakest active player right now</p>'
+            f'<div class="gains"><b>{pts_txt(i["net"])} roto</b> projected by the end of next week · {esc(delta_txt(i))}</div></div>')
+    ideas_html = "".join(ideas) or ('<p class="ok">No pickup is projected to gain you a roto point '
+                                    'by the end of next week</p>')
 
     weak = [c["cat"] for c in sorted(d["plans"], key=lambda c: c["pts"] or 0)[:3]]
     fa_rows = []
@@ -738,7 +837,9 @@ def page_players(d):
     return ("Players", '<section><h2>Add and drop ideas</h2>'
             '<p class="note-p first">Your 3 bench spots are full, so every add needs a drop. Players on IL are never suggested as drops.</p>'
             f'<div class="ideas">{ideas_html}</div>'
-            '<p class="note-p">Value compares per-game production across all 8 categories, with percentages weighted by attempts. Make any move yourself in the Yahoo app.</p></section>'
+            '<p class="note-p">Ranked by the roto points each swap is projected to win or lose by the end of next week, '
+            'given your current ranks and every team\'s pace. Only your five lowest-value active players are drop '
+            'candidates, and a pickup must hold up in long-run value too. Make any move yourself in the Yahoo app.</p></section>'
             f'<section><h2>Available players</h2><div class="scroll"><table><thead><tr><th>Player</th><th class="num">Value</th>'
             f'<th class="num">This wk</th><th class="num">Next wk</th>{stat_heads()}</tr></thead><tbody>{"".join(fa_rows)}</tbody></table></div>'
             '<p class="note-p">Yahoo\'s top 25 available players, sorted by value for your team. "Helps" marks players who are strong in your weakest categories.</p></section>')
@@ -793,11 +894,20 @@ def render(d, path):
     rank = me["rank"]
     suffix = "th" if 10 <= rank % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(rank % 10, "th")
     nav = "".join(f'<a href="{href}"{" class=on" if href == path else ""}>{label}</a>' for href, label in NAV)
+    others = [r for r in d["rows"] if r is not me]
+    if rank == 1 and others:
+        nxt = max(others, key=lambda r: r["total"])
+        margin = f'{me["total"] - nxt["total"]:g} ahead of {esc(nxt["name"])}'
+    elif others:
+        top = max(others, key=lambda r: r["total"])
+        margin = f'{top["total"] - me["total"]:g} behind {esc(top["name"])}'
+    else:
+        margin = ""
     return PAGE.format(
         title=esc(title), team=esc(me["name"]), today=esc(d["today"].strftime("%A, %B %-d")),
         now=esc(d["built"].strftime("%a %b %-d, %-I:%M %p")), place=f"{rank}{suffix}",
-        nteams=len(d["rows"]), total=f'{me["total"]:g}', nav=nav, body=body, cache=CACHE_MIN,
-        refresh=esc(path if path != "/" else ""))
+        nteams=len(d["rows"]), total=f'{me["total"]:g}', margin=margin, nav=nav, body=body,
+        cache=CACHE_MIN, refresh=esc(path if path != "/" else ""))
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -821,11 +931,13 @@ main{{max-width:1240px;margin:0 auto;padding:32px 24px 64px}}
 .sub{{color:var(--mut);font-size:12px;line-height:16px;margin-top:2px}}
 a{{color:var(--acc);text-decoration:none;transition:color 150ms cubic-bezier(.22,1,.36,1)}}a:hover{{color:var(--ink)}}
 b{{font-weight:500}}
+.sr{{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}}
 
 header{{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:20px}}
 h1{{font-size:28px;line-height:32px;font-weight:500;margin:0}}
 .meta{{color:var(--mut);font-size:13px;margin-top:4px}}
 .standing{{text-align:right}}.standing .big{{font-family:"Geist Mono",monospace;font-size:28px;line-height:32px;font-weight:500;color:var(--acc)}}
+.standing .lead{{font:500 14px/20px Geist,system-ui,sans-serif;color:var(--ink);margin-left:12px;vertical-align:4px}}
 nav{{display:flex;gap:4px;overflow-x:auto;margin:0 0 24px;padding-bottom:4px;border-bottom:1px solid var(--line)}}
 nav a{{color:var(--sec);padding:8px 12px;border-radius:8px;white-space:nowrap;transition:background-color 150ms cubic-bezier(.22,1,.36,1),color 150ms cubic-bezier(.22,1,.36,1)}}
 nav a:hover{{background:var(--raised);color:var(--ink)}}nav a.on{{color:var(--ink);background:var(--raised);box-shadow:inset 0 -2px 0 var(--acc)}}
@@ -923,7 +1035,7 @@ section{{padding:16px}}.scroll{{margin:0 -16px;padding:0 16px}}
 </style></head><body><main>
 <header><div><h1>{team} · {today}</h1>
 <div class="meta">Updated {now} · <a href="/refresh{refresh}">Refresh</a></div></div>
-<div class="standing"><div class="big">{place}</div><div class="meta">of {nteams} teams · {total} roto points</div></div></header>
+<div class="standing"><div class="big">{place}<span class="lead">{margin}</span></div><div class="meta">of {nteams} teams · {total} roto points</div></div></header>
 <nav>{nav}</nav>
 {body}
 <footer>Private site on your Tailscale network. Data from Yahoo Fantasy (read-only, personal use) and ESPN's public schedule. Refreshes at most every {cache} minutes.</footer>
