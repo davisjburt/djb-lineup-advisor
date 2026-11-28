@@ -26,6 +26,8 @@ import os
 import statistics
 import threading
 import time
+import unicodedata
+from collections import Counter
 from zoneinfo import ZoneInfo
 
 import requests
@@ -49,6 +51,12 @@ CATS = [("5", "FG%"), ("8", "FT%"), ("10", "3PTM"), ("12", "PTS"),
 CAT_NAMES = [name for _, name in CATS]
 PCT = {"FG%": ("FGM/A", "9004003"), "FT%": ("FTM/A", "9007006")}
 IL_SLOTS = {"IL", "IL+", "IR"}
+ESPN_INJURIES = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+
+# Share of a player's games we expect him to play, by injury tag. Out players
+# are never suggested as normal adds, only as IL stashes.
+AVAILABILITY = {"P": 0.9, "Q": 0.5, "GTD": 0.5, "DTD": 0.6}
+RECENT_DROP_HOURS = 30  # a player dropped this recently may still be on waivers
 
 # Thresholds in "player-games": one full day of starters is about 10.
 CLOSE_GAMES = 20      # a point is "within reach" inside ~2 days of production
@@ -109,6 +117,51 @@ def espn_day(day):
                     "detail": st.get("shortDetail", ""),
                 }
     return out
+
+
+def norm_name(name):
+    """'Nikola Jokić Jr.' -> 'nikola jokic' so Yahoo and ESPN names match."""
+    s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode().lower()
+    s = "".join(ch if ch.isalnum() or ch == " " else " " for ch in s)
+    return " ".join(w for w in s.split() if w not in {"jr", "sr", "ii", "iii", "iv"})
+
+
+def espn_injuries():
+    """{normalized name: {status, ret, note}} from ESPN's public injury list.
+    status is "O" or "DTD"; ret is ESPN's estimated return date (or None).
+    Yahoo's tags often lag, so this fills gaps. Returns {} if ESPN is down."""
+    try:
+        r = requests.get(ESPN_INJURIES, timeout=20)
+        r.raise_for_status()
+        out = {}
+        for team in r.json().get("injuries", []):
+            for inj in team.get("injuries", []):
+                name = norm_name((inj.get("athlete") or {}).get("displayName"))
+                raw = (inj.get("status") or "").lower()
+                if not name or not raw:
+                    continue
+                status = "O" if raw.startswith("out") or "suspen" in raw else "DTD"
+                ret = None
+                try:
+                    ret = dt.date.fromisoformat(str((inj.get("details") or {}).get("returnDate"))[:10])
+                except ValueError:
+                    pass
+                out[name] = {"status": status, "ret": ret, "note": inj.get("shortComment") or ""}
+        return out
+    except Exception:
+        log.warning("couldn't load ESPN injuries; using Yahoo tags only", exc_info=True)
+        return {}
+
+
+def eff_status(p, inj):
+    """Yahoo's tag, upgraded to ESPN's when ESPN is more severe (e.g. Yahoo Q, ESPN Out)."""
+    y = (p.get("status") or "").upper()
+    e = (inj.get(norm_name(p.get("name"))) or {}).get("status")
+    if y in OUT_STATUSES:
+        return y
+    if e == "O":
+        return "O"
+    return y or (e or "")
 
 
 def schedule(today):
@@ -194,6 +247,18 @@ def available_players(lg, lk):
     return players, headshots(j["fantasy_content"]["league"][1]["players"])
 
 
+def stash_pool(lg, lk):
+    """Top 25 available players by Yahoo's overall rank. Injured players drop out
+    of the actual-rank list while they sit, so this is where IL stashes show up."""
+    try:
+        j = lg.yhandler.get(f"league/{lk}/players;status=A;sort=OR;count=25/percent_owned")
+        _, players = lg._players_from_page(j)
+        return players, headshots(j["fantasy_content"]["league"][1]["players"])
+    except Exception:
+        log.warning("couldn't load the IL-stash pool", exc_info=True)
+        return [], {}
+
+
 def season_avgs(lg, ids):
     if not ids:
         return {}
@@ -227,29 +292,42 @@ def recent_transactions(lg, count=15):
 
 
 # ------------------------------------------------------------------ analysis
-def classify_moves(roster, moves):
-    """Turn the lineup plan into moves, flagging which actually gain you something."""
+def classify_moves(roster, moves, positions):
+    """Turn the lineup plan into the moves that actually change who counts today.
+
+    The plan benches every idle starter. Benching one only matters when someone
+    else needs his slot, so an idle starter whose slot nobody takes stays put and
+    isn't listed. Returns (moves to show, final slot for every player)."""
     cur = {p["player_id"]: p.get("selected_position", BENCH) for p in roster}
     byid = {p["player_id"]: p for p in roster}
-    changed = [m for m in moves if cur.get(m["player_id"]) != m["selected_position"]]
-    gains = any(cur[m["player_id"]] in NON_STARTING and m["selected_position"] not in NON_STARTING
-                for m in changed)
+    final = dict(cur)
+    final.update({m["player_id"]: m["selected_position"] for m in moves})
+    cap = {pos: int(info.get("count", 0)) for pos, info in positions.items() if pos not in NON_STARTING}
+    used = Counter(pos for pos in final.values() if pos in cap)
+    for m in moves:
+        pid, old, new = m["player_id"], cur.get(m["player_id"]), m["selected_position"]
+        status = (byid[pid].get("status") or "").upper()
+        if new == BENCH and old in cap and status not in OUT_STATUSES and used[old] < cap[old]:
+            final[pid] = old  # his slot is still free, so leaving him there changes nothing
+            used[old] += 1
+
     out = []
-    for m in changed:
-        p, old, new = byid[m["player_id"]], cur[m["player_id"]], m["selected_position"]
+    for pid, new in final.items():
+        old = cur[pid]
+        if old == new:
+            continue
+        p = byid[pid]
         status = (p.get("status") or "").upper()
         if old in NON_STARTING and new not in NON_STARTING:
-            kind, why = "do", "He has a game today; put him in the lineup"
+            why = "He has a game today; put him in the lineup"
         elif new == BENCH and status in OUT_STATUSES:
-            kind, why = "do", f"Listed {status}; don't start him"
+            why = f"Listed {status}; don't start him"
         elif new == BENCH:
-            kind = "do" if gains else "optional"
-            why = "No game today" + ("" if gains else ", and nobody with a game can take the spot, so this changes nothing")
+            why = "No game today, and a player with a game needs his slot"
         else:
-            kind, why = "do", "Position swap that makes room for another starter"
-        out.append({"pid": p["player_id"], "name": p["name"], "old": old, "new": new,
-                    "kind": kind, "why": why})
-    return out
+            why = "Position swap that makes room for another starter"
+        out.append({"pid": pid, "name": p["name"], "old": old, "new": new, "kind": "do", "why": why})
+    return out, final
 
 
 def player_values(pool, avgs):
@@ -450,13 +528,16 @@ def swap_delta(rows, me, proj, add_avg, add_g, drop_avg, drop_g):
     return deltas
 
 
-def waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, today, next_mon):
+def waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, today, next_mon, inj):
     """Add/drop pairs ranked by the roto points they're projected to win or lose
     through the end of next week, given your current ranks.
 
     Every add needs a drop: the 3 bench spots are full and IL slots don't count,
-    so players on IL are never suggested as drops. Only your lower-value players
-    are drop candidates, and a pickup has to be close to them in long-run value."""
+    so players on IL are never suggested as drops. Your five lowest-value non-IL
+    players (bench included, whether or not they play today) are the drop
+    candidates, and a pickup has to be close to them in long-run value.
+    Injured pickups: Out (Yahoo or ESPN) are skipped; Q/GTD/DTD count for only
+    part of their games."""
     days = (next_mon - today).days + 7
     horizon_pg = 10 * days  # about 10 player-games a day for every team
     proj = project(rows, horizon_pg)
@@ -465,6 +546,9 @@ def waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, t
         code = team_code(p.get("editorial_team_abbr"))
         return wk_this.get(code, 0) + wk_next.get(code, 0)
 
+    def avail(p):
+        return AVAILABILITY.get(eff_status(p, inj), 1.0)
+
     droppable = sorted((p for p in roster if p.get("selected_position") not in IL_SLOTS
                         and int(p["player_id"]) in value), key=lambda p: value[int(p["player_id"])])[:5]
     pairs = []
@@ -472,11 +556,12 @@ def waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, t
         did = int(drop["player_id"])
         for add in fa:
             aid = int(add["player_id"])
-            if aid not in avgs or (add.get("status") or "").upper() in OUT_STATUSES:
+            if aid not in avgs or eff_status(add, inj) in OUT_STATUSES:
                 continue
             if value.get(aid, -99) < value[did] - 0.5:
                 continue  # don't trade long-run value for a short-term bump
-            deltas = swap_delta(rows, me, proj, avgs[aid], games(add), avgs[did], games(drop))
+            deltas = swap_delta(rows, me, proj, avgs[aid], games(add) * avail(add),
+                                avgs[did], games(drop) * avail(drop))
             net = sum(deltas.values())
             pairs.append((net, value.get(aid, 0) - value[did], add, drop, deltas))
     pairs.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -491,8 +576,47 @@ def waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, t
         ideas.append({"add": add, "drop": drop, "net": net, "vdiff": vdiff,
                       "ups": {c: v for c, v in deltas.items() if v > 0},
                       "downs": {c: v for c, v in deltas.items() if v < 0},
-                      "add_games": games(add), "drop_games": games(drop), "days": days})
+                      "add_games": games(add), "drop_games": games(drop), "days": days,
+                      "add_status": eff_status(add, inj)})
     return ideas
+
+
+def open_il_slots(roster, positions):
+    total_il = sum(int(info.get("count", 0)) for pos, info in positions.items() if pos in IL_SLOTS)
+    return max(0, total_il - sum(1 for p in roster if p.get("selected_position") in IL_SLOTS))
+
+
+def il_stash(pool, avgs, value, inj, open_il):
+    """Injured free agents worth parking in an open IL slot (no drop needed).
+    Yahoo decides IL eligibility from its own tag, so an ESPN-only Out doesn't count."""
+    if not open_il:
+        return []
+    seen, out = set(), []
+    for p in pool:
+        pid = int(p["player_id"])
+        il_ok = (p.get("status") or "").upper() in {"O", "INJ"} or IL_SLOTS & set(p.get("eligible_positions", []))
+        if pid in seen or pid not in avgs or not il_ok:
+            continue
+        seen.add(pid)
+        if value.get(pid, -99) <= 0:
+            continue  # only players who'd help once healthy
+        e = inj.get(norm_name(p["name"])) or {}
+        out.append({"p": p, "value": value[pid], "status": eff_status(p, inj),
+                    "ret": e.get("ret"), "note": e.get("note", "")})
+    out.sort(key=lambda x: x["value"], reverse=True)
+    return out[:3]
+
+
+def recent_drops(activity, now):
+    """{player name: drop time} for players dropped recently enough to still be on waivers."""
+    out = {}
+    for t in activity:
+        if now - t["when"] > dt.timedelta(hours=RECENT_DROP_HOURS):
+            continue
+        for m in t["moves"]:
+            if m["type"] == "drop":
+                out.setdefault(m["player"], t["when"])
+    return out
 
 
 # ------------------------------------------------------------------ build (all data, one pass)
@@ -507,16 +631,20 @@ def build():
     games_today = espn_day(today)
     states = {c: g["state"] for c, g in games_today.items()}
     moves, _ = plan_lineup([dict(p) for p in roster], positions, states)
-    plan_pos = {m["player_id"]: m["selected_position"] for m in moves}
+    shown_moves, plan_pos = classify_moves(roster, moves, positions)
 
     fa, shots = available_players(lg, lk)
     try:
         shots.update(roster_headshots(lg, lk))
     except Exception:  # headshots are a nicety; never fail the page over them
         log.warning("couldn't load roster headshots", exc_info=True)
+    stash, stash_shots = stash_pool(lg, lk)
+    shots.update(stash_shots)
+    inj = espn_injuries()
     wk_this, wk_next, per_day, next_mon = schedule(today)
 
-    ids = [int(p["player_id"]) for p in roster] + [int(p["player_id"]) for p in fa]
+    ids = list(dict.fromkeys([int(p["player_id"]) for p in roster] + [int(p["player_id"]) for p in fa]
+                             + [int(p["player_id"]) for p in stash]))
     avgs = season_avgs(lg, ids)
     value, per_cat = player_values(ids, avgs)
     plans = category_plans(rows, me, roster, avgs, per_cat, wk_this)
@@ -526,14 +654,17 @@ def build():
         log.warning("couldn't load transactions", exc_info=True)
         activity = []
 
+    built = dt.datetime.now(TZ)
+    open_il = open_il_slots(roster, positions)
     return {
-        "today": today, "built": dt.datetime.now(TZ), "roster": roster, "positions": positions,
+        "today": today, "built": built, "roster": roster, "positions": positions,
         "rows": rows, "me": me, "games": games_today, "plan_pos": plan_pos,
-        "moves": classify_moves(roster, moves), "fa": fa, "shots": shots,
+        "moves": shown_moves, "fa": fa, "shots": shots, "inj": inj,
         "wk_this": wk_this, "wk_next": wk_next, "per_day": per_day, "next_mon": next_mon,
         "avgs": avgs, "value": value, "per_cat": per_cat, "plans": plans,
-        "ideas": waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, today, next_mon),
-        "activity": activity,
+        "ideas": waiver_ideas(roster, fa, avgs, value, rows, me, wk_this, wk_next, per_day, today, next_mon, inj),
+        "open_il": open_il, "stash": il_stash(stash + fa, avgs, value, inj, open_il),
+        "drops": recent_drops(activity, built), "activity": activity,
     }
 
 
@@ -635,6 +766,19 @@ def delta_txt(i):
     return ", ".join(parts)
 
 
+def waiver_txt(d, p):
+    when = d["drops"].get(p["name"])
+    return (f'Dropped {when.strftime("%b %-d, %-I:%M %p")}, so he may still be on waivers. '
+            'Check he shows as a free agent first' if when else "")
+
+
+def stash_txt(d, s):
+    a = d["avgs"].get(int(s["p"]["player_id"]), {})
+    line = f'{stat(a.get("PTS"), "PTS")} PTS, {stat(a.get("3PTM"), "3PTM")} 3PTM, {stat(a.get("REB"), "REB")} REB a game'
+    ret = f'ESPN expects him back around {s["ret"].strftime("%b %-d")}' if s["ret"] else "No return date from ESPN"
+    return f'{line}. {s["note"] + " " if s["note"] else ""}{ret}'.strip()
+
+
 def games_compare(i):
     a, dr, ag, dg = i["add"]["name"], i["drop"]["name"], i["add_games"], i["drop_games"]
     if ag == dg:
@@ -681,7 +825,20 @@ def page_actions(d):
         a, dr = i["add"], i["drop"]
         why = (f'Projected {pts_txt(i["net"])} roto point{"" if abs(i["net"]) == 1 else "s"} by the end of next week '
                f'({delta_txt(i)}). {games_compare(i)}')
+        if i["add_status"]:
+            why += f'. Listed {i["add_status"]}, so his games are discounted'
+        if waiver_txt(d, a):
+            why += f'. {waiver_txt(d, a)}'
         items.append((4, "Waiver idea", f'Consider adding <b>{esc(a["name"])}</b> for <b>{esc(dr["name"])}</b>',
+                      esc(why) + '. <a href="/players">See all options</a>'))
+
+    for s in d["stash"][:1]:
+        p = s["p"]
+        why = (f'You have {d["open_il"]} open IL slot{"" if d["open_il"] == 1 else "s"}, so no drop is needed now. '
+               f'{stash_txt(d, s)}. When he\'s healthy you\'ll need to drop someone to activate him')
+        if waiver_txt(d, p):
+            why += f'. {waiver_txt(d, p)}'
+        items.append((3.5, "IL stash", f'Add <b>{esc(p["name"])}</b> straight to IL ({esc(s["status"])})',
                       esc(why) + '. <a href="/players">See all options</a>'))
 
     # The team sitting just above you in the most close categories.
@@ -819,6 +976,22 @@ def page_players(d):
     ideas_html = "".join(ideas) or ('<p class="ok">No pickup is projected to gain you a roto point '
                                     'by the end of next week</p>')
 
+    stash_items = ""
+    for s in d["stash"]:
+        meta = f'{esc(s["p"].get("editorial_team_abbr", ""))} · value {s["value"]:+.1f}'
+        wtxt = waiver_txt(d, s["p"])
+        stash_items += (f'<div class="idea"><div class="side"><span class="lbl">Add to IL</span>'
+                        f'{player_cell(d, s["p"], badge(s["status"]), meta=meta)}</div>'
+                        f'<div class="gains">{esc(stash_txt(d, s))}' + (f'. {esc(wtxt)}' if wtxt else "") + '</div></div>')
+    if d["open_il"]:
+        stash_html = ('<section><h2>IL stash</h2>'
+                      f'<p class="note-p first">You have {d["open_il"]} open IL slot{"" if d["open_il"] == 1 else "s"}. '
+                      'An injured free agent can go straight there with no drop; activating him later needs a drop.</p>'
+                      + (f'<div class="ideas">{stash_items}</div>' if stash_items else
+                         '<p class="ok">No injured free agent is worth stashing right now</p>') + '</section>')
+    else:
+        stash_html = ""
+
     weak = [c["cat"] for c in sorted(d["plans"], key=lambda c: c["pts"] or 0)[:3]]
     fa_rows = []
     for p in sorted(d["fa"], key=lambda p: d["value"].get(int(p["player_id"]), -99), reverse=True):
@@ -826,20 +999,26 @@ def page_players(d):
         a = d["avgs"].get(pid, {})
         helps = [c for c in weak if d["per_cat"].get(c, {}).get(pid, 0) > 0.5]
         tag = f'<span class="helps">Helps {esc(", ".join(helps))}</span>' if helps else ""
+        if p["name"] in d["drops"]:
+            tag += '<span class="helps muted">Recently dropped, may be on waivers</span>'
         code = team_code(p.get("editorial_team_abbr"))
         meta = (f'{esc(p.get("editorial_team_abbr", ""))} · {esc(positions_of(p))} · '
                 f'{p.get("percent_owned", 0)}% owned')
         fa_rows.append(
-            f'<tr><td>{player_cell(d, p, badge((p.get("status") or "").upper()) + tag, meta)}</td>'
+            f'<tr><td>{player_cell(d, p, badge(eff_status(p, d["inj"])) + tag, meta)}</td>'
             f'<td class="num">{d["value"].get(pid, 0):+.1f}</td><td class="num">{d["wk_this"].get(code, 0)}</td>'
             f'<td class="num">{d["wk_next"].get(code, 0)}</td>'
             + "".join(f'<td class="num">{stat(a.get(c), c)}</td>' for c in CAT_NAMES) + "</tr>")
     return ("Players", '<section><h2>Add and drop ideas</h2>'
-            '<p class="note-p first">Your 3 bench spots are full, so every add needs a drop. Players on IL are never suggested as drops.</p>'
+            '<p class="note-p first">Your 3 bench spots are full, so every add to an active or bench spot needs a drop. '
+            'Players on IL are never suggested as drops.</p>'
             f'<div class="ideas">{ideas_html}</div>'
             '<p class="note-p">Ranked by the roto points each swap is projected to win or lose by the end of next week, '
-            'given your current ranks and every team\'s pace. Only your five lowest-value active players are drop '
-            'candidates, and a pickup must hold up in long-run value too. Make any move yourself in the Yahoo app.</p></section>'
+            'given your current ranks and every team\'s pace. Drop candidates are your five lowest-value non-IL players, '
+            'bench included, whether or not they play today; a pickup must hold up in long-run value too. '
+            'Players listed Out (by Yahoo or ESPN) aren\'t suggested here, and Q/GTD/DTD players count for only part of '
+            'their games. Make any move yourself in the Yahoo app.</p></section>'
+            + stash_html +
             f'<section><h2>Available players</h2><div class="scroll"><table><thead><tr><th>Player</th><th class="num">Value</th>'
             f'<th class="num">This wk</th><th class="num">Next wk</th>{stat_heads()}</tr></thead><tbody>{"".join(fa_rows)}</tbody></table></div>'
             '<p class="note-p">Yahoo\'s top 25 available players, sorted by value for your team. "Helps" marks players who are strong in your weakest categories.</p></section>')
